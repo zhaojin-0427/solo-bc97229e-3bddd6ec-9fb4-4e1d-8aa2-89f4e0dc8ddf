@@ -9,6 +9,7 @@ import asyncio
 import inspect
 import json
 import re
+import types
 from urllib.parse import parse_qs
 
 from starlette import BackgroundTasks, HTTPException, Request
@@ -31,6 +32,9 @@ class FastAPI:
         self.lifespan = lifespan
         self.routes: list[tuple[str, re.Pattern, list[str], object]] = []
         self._lifespan_started = False
+        # Mirrors starlette's app.state namespace used for shared services
+        # (e.g. the version reaper and test coordination hooks).
+        self.state = types.SimpleNamespace()
 
     async def _ensure_started(self) -> None:
         if self._lifespan_started or self.lifespan is None:

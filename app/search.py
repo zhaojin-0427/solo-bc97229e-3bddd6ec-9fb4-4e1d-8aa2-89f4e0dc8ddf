@@ -187,7 +187,6 @@ def search(
             "non-whitespace characters"
         )
 
-    total_len = _compact_length(conn, vid)
     hits: list[dict] = []
     # After collecting ``limit`` matches we keep checking candidates with a
     # bounded budget so ``has_more`` means a real 101st match exists, rather
@@ -195,9 +194,17 @@ def search(
     overflow_budget = max(limit, 1000)
     has_more = False
 
-    # One read-only transaction gives a consistent snapshot for the whole query.
+    # One read-only transaction gives a consistent snapshot for the WHOLE
+    # query. It must be opened before the first table access: SQLite only takes
+    # its snapshot on the first statement of a transaction, so opening it here
+    # pins the schema (the version's tables cannot appear to vanish mid-query)
+    # and guarantees the compact length, posting lists, verification windows
+    # and highlight coordinates all come from the same complete version. The
+    # caller additionally holds a reaper pin for ``vid`` for the request
+    # lifetime, so the tables cannot be dropped while this snapshot is open.
     conn.execute("BEGIN DEFERRED")
     try:
+        total_len = _compact_length(conn, vid)
         for candidate in _iter_candidates(conn, vid, needle):
             if candidate < 0 or candidate + len(needle) > total_len:
                 continue

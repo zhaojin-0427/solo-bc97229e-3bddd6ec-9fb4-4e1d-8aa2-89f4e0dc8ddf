@@ -195,12 +195,16 @@ def fail_version(conn: sqlite3.Connection, vid: int, error: str) -> None:
 
 def activate_version(
     conn: sqlite3.Connection, doc_id: str, vid: int, block_count: int
-) -> None:
-    """Atomically point the document at the newly built version.
+) -> Optional[int]:
+    """Point the document at the newly built version in one transaction.
 
-    The catalog flip happens in one transaction; the old version's tables are
-    dropped afterwards in a second transaction so readers always see either the
-    complete old version or the complete new one.
+    Only the catalog flips here so readers always see either the complete old
+    version or the complete new one. The superseded version's tables are *not*
+    dropped by this function: it returns the previous version id (or ``None``)
+    and the caller hands it to the :class:`~app.reaper.VersionReaper`, which
+    coordinates the drop with searches still reading that version. Dropping in a
+    separate transaction after the switch would otherwise raise
+    ``no such table`` inside a request that selected the old version first.
     """
     old = conn.execute(
         "SELECT active_version_id FROM documents WHERE doc_id = ?", (doc_id,)
@@ -216,9 +220,7 @@ def activate_version(
             "UPDATE documents SET active_version_id = ?, updated_at = ? WHERE doc_id = ?",
             (vid, time.time(), doc_id),
         )
-    if old_vid is not None and old_vid != vid:
-        with transaction(conn):
-            drop_version_tables(conn, old_vid)
+    return old_vid
 
 
 def get_active_version(conn: sqlite3.Connection, doc_id: str) -> Optional[int]:
@@ -251,7 +253,11 @@ def startup_recovery(conn: sqlite3.Connection) -> list[str]:
     """Recover from interrupted processes.
 
     Every version that never reached a terminal state is marked FAILED and its
-    staging tables are removed. Returns human-readable recovery messages.
+    staging tables are removed. Tables left behind by any version that is no
+    longer a document's active version (for example a superseded version whose
+    deferred drop never ran because the process was killed while a slow search
+    still held it) are reclaimed here too, so obsolete tables never accumulate.
+    Returns human-readable recovery messages.
     """
     messages: list[str] = []
     init_schema(conn)
@@ -268,24 +274,54 @@ def startup_recovery(conn: sqlite3.Connection) -> list[str]:
             f"(was {row['state']!r})"
         )
 
-    # Garbage-collect tables belonging to failed versions (e.g. tables that
-    # survived because fail_version itself was interrupted mid-way).
+    # Garbage-collect every version table that does not belong to a currently
+    # active version: failed staging tables, superseded READY versions whose
+    # deferred drop was interrupted, and tables left over from a removed row.
+    # A fresh process has no in-flight readers, so the in-process pin registry
+    # starts empty and nothing here can be pinned.
     existing = {
         name
         for (name,) in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()
     }
-    failed_ids = [
-        int(r["version_id"])
+    active_ids = {
+        int(r["active_version_id"])
         for r in conn.execute(
-            "SELECT version_id FROM versions WHERE state = ?", (STATE_FAILED,)
+            "SELECT active_version_id FROM documents "
+            "WHERE active_version_id IS NOT NULL"
+        ).fetchall()
+    }
+    known_versions = [
+        (int(r["version_id"]), r["state"])
+        for r in conn.execute(
+            "SELECT version_id, state FROM versions"
         ).fetchall()
     ]
-    for vid in failed_ids:
+    for vid, state in known_versions:
+        if vid in active_ids:
+            continue
         blocks, unigrams, bigrams = _version_tables(vid)
-        with transaction(conn):
-            for name in (bigrams, unigrams, blocks):
-                if name in existing:
+        dropped = [name for name in (bigrams, unigrams, blocks) if name in existing]
+        if dropped:
+            with transaction(conn):
+                for name in dropped:
                     conn.execute(f"DROP TABLE {name}")
+            if state == STATE_READY:
+                messages.append(
+                    f"superseded version {vid} tables reclaimed on startup"
+                )
+
+    # Orphaned tables (prefix blocks_/unigrams_/bigrams_) without a versions
+    # row at all are removed defensively.
+    catalog_ids = {vid for vid, _state in known_versions}
+    for name in sorted(existing):
+        for prefix in ("blocks_", "unigrams_", "bigrams_"):
+            if name.startswith(prefix):
+                suffix = name[len(prefix):]
+                if suffix.isdigit() and int(suffix) not in catalog_ids:
+                    with transaction(conn):
+                        conn.execute(f"DROP TABLE {name}")
+                    messages.append(f"orphan table {name!r} removed on startup")
+                break
     return messages

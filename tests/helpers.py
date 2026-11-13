@@ -18,11 +18,13 @@ def reset_db() -> None:
             pass
 
 
-def make_app():
+def make_app(reaper=None):
     # Import after env vars are set so the configured DB path takes effect.
     from app.main import create_app
 
-    return create_app()
+    if reaper is None:
+        return create_app()
+    return create_app(version_reaper=reaper)
 
 
 def wsgi_request(app, method: str, path: str, body: bytes = b"",

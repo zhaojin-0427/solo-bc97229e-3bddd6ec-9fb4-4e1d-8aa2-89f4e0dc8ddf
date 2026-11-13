@@ -8,7 +8,13 @@ Concurrency model (single uvicorn worker)
   arbitrarily large upload never resides in memory and never blocks the loop.
 * Indexing happens after the upload response (202) is returned; the previous
   active version stays fully searchable until the atomic catalog switch.
-* Search opens a short-lived read-only snapshot of the active version.
+* Every search *pins* the version it selects before opening its read snapshot.
+  When a correction publishes, the catalog flips immediately and the superseded
+  version's tables are only reaped once every search pinning that version has
+  finished (see :mod:`app.reaper`). A request therefore always reads the
+  complete version it selected — its text length, indexes, hits and highlight
+  coordinates never change underneath it, and a slow search never blocks the
+  publication or the new version becoming searchable.
 """
 from __future__ import annotations
 
@@ -16,13 +22,15 @@ import asyncio
 import contextlib
 import logging
 import queue
+import sqlite3
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 
-from . import config, db, ingest, search
+from . import config, db, ingest, reaper, search
+from .reaper import VersionReaper
 from .schemas import (
     DocumentInfo,
     Health,
@@ -91,24 +99,49 @@ async def _stream_ingest(
     return result
 
 
-def _index_in_background(doc_id: str, vid: int, block_count: int) -> None:
+def _drop_version_tables(vid: int) -> None:
+    """Drop one version's tables on a fresh connection (runs in a worker thread).
+
+    Used as the reaper's drop callback: it must own its connection because the
+    deferral may happen on a different thread long after the publishing
+    connection is gone.
+    """
+    conn = db.get_conn()
+    try:
+        with db.transaction(conn):
+            db.drop_version_tables(conn, vid)
+    finally:
+        conn.close()
+
+
+def _index_in_background(
+    doc_id: str, vid: int, block_count: int, version_reaper: VersionReaper
+) -> None:
     """Promote a fully ingested version; any failure keeps the old version."""
     conn = db.get_conn()
     try:
         db.set_state(conn, vid, db.STATE_INDEXING)
         # Indexes were built incrementally during ingestion; the tables are
         # already durable. This step is the single atomic visibility switch.
-        db.activate_version(conn, doc_id, vid, block_count)
+        old_vid = db.activate_version(conn, doc_id, vid, block_count)
         logger.info("document %r switched to version %s", doc_id, vid)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("background indexing failed for version %s", vid)
         with contextlib.suppress(Exception):
             db.fail_version(conn, vid, f"indexing failed: {exc}")
+        return
     finally:
         conn.close()
 
+    # Reclaim the superseded version's tables *after* the catalog committed.
+    # The reaper defers the drop while a slow search still pins the old
+    # version, but never keeps it beyond that request. A fresh connection is
+    # used inside the callback so this works even when the drop is deferred.
+    if old_vid is not None and old_vid != vid:
+        version_reaper.retire(old_vid, _drop_version_tables)
 
-def create_app() -> FastAPI:
+
+def create_app(version_reaper: VersionReaper | None = None) -> FastAPI:
     config.ensure_dirs()
 
     @asynccontextmanager
@@ -131,9 +164,18 @@ def create_app() -> FastAPI:
             "Upload OCR block streams (UTF-8 NDJSON) per document and search "
             "the whitespace-insensitive text, including matches that cross "
             "blocks and scan pages. Re-uploading a document builds a new "
-            "version that replaces the old one atomically."
+            "version that replaces the old one atomically; a search that "
+            "started before the replacement keeps reading the complete "
+            "version it selected until it finishes."
         ),
     )
+
+    # Coordinates old-version table reclamation with in-flight searches.
+    # Registry state is process-local and intentionally not persisted: on
+    # restart there are no readers and startup_recovery() reaps stale tables.
+    if version_reaper is None:
+        version_reaper = reaper.VersionReaper()
+    app.state.version_reaper = version_reaper
 
     locks: dict[str, asyncio.Lock] = {}
     recovery_messages: list[str] = []
@@ -230,7 +272,9 @@ def create_app() -> FastAPI:
             finally:
                 conn.close()
 
-        background_tasks.add_task(_index_in_background, doc_id, vid, block_count)
+        background_tasks.add_task(
+            _index_in_background, doc_id, vid, block_count, version_reaper
+        )
         return ReplacementAccepted(
             doc_id=doc_id,
             version_id=vid,
@@ -250,6 +294,13 @@ def create_app() -> FastAPI:
         Whitespace in ``q`` and in the stored text is ignored. Matches may span
         multiple blocks and pages; overlapping matches are returned separately.
         At most the earliest 100 matches are returned.
+
+        The active version is pinned before any read. If a correction publishes
+        between reading the catalog pointer and taking the pin, the selected
+        version is already retired and the request re-reads the pointer once and
+        serves the new version. Once pinned, the whole query runs against one
+        consistent snapshot of that exact version, so text length, index
+        lookups, hits and highlight coordinates can never change mid-request.
         """
         _validate_doc_id(doc_id)
         compact_q = "".join(q.split())
@@ -261,21 +312,58 @@ def create_app() -> FastAPI:
                     f"{config.QUERY_MAX_CHARS} non-whitespace characters"
                 ),
             )
+
         conn = db.get_conn()
+        vid = None
         try:
-            vid = db.get_active_version(conn, doc_id)
+            # Select-and-pin, retrying only when the selected version is
+            # retired before the pin lands. At most two catalog reads happen
+            # per request: a second correction during the retry simply pins
+            # the newly selected version, whose tables cannot have been reaped
+            # yet (reaping only targets already-superseded versions).
+            for _attempt in range(2):
+                selected = db.get_active_version(conn, doc_id)
+                if selected is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="document not found or no searchable version yet",
+                    )
+                if version_reaper.pin(selected):
+                    vid = selected
+                    break
+                # Lost the race with a publication; loop once to re-select.
             if vid is None:
                 raise HTTPException(
-                    status_code=404,
-                    detail="document not found or no searchable version yet",
+                    status_code=503,
+                    detail="document version changed while selecting; please retry",
                 )
+
+            # Test/coordination hook: fires with the pin held and before the
+            # read snapshot opens, allowing deterministic interleaving tests.
+            hook = getattr(app.state, "on_search_pinned", None)
+            if hook is not None:
+                hook(doc_id, vid)
+
             try:
                 result = search.search(conn, vid, q)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except sqlite3.Error as exc:
+                # Should be impossible while a pin is held; surface clearly
+                # rather than leaking a 500 with "no such table".
+                logger.exception(
+                    "storage error while searching pinned version %s of %r",
+                    vid,
+                    doc_id,
+                )
+                raise HTTPException(
+                    status_code=500, detail=f"search storage failure: {exc}"
+                ) from exc
             return SearchResponse(**result)
         finally:
             conn.close()
+            if vid is not None:
+                version_reaper.unpin(vid)
 
     return app
 

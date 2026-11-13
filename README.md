@@ -18,6 +18,7 @@
 | 原文、位置映射、索引一起切换 | 切换只在三者全部落盘后发生，单事务更新目录指针 |
 | 同文档同时只接受一次替换 | 进程内 asyncio 锁 + SQLite 目录状态双重保证，冲突返回 409 |
 | 坏行 / 写盘失败 / 进程中断保留旧版 | 失败版本标记 `failed` 并清理暂存表；启动恢复把未完成版本统一标失败 |
+| 慢检索与更正发布并发互不破坏 | 检索先**钉住（pin）**所选版本再开读快照；旧版表的回收推迟到最后一个钉住它的检索结束，绝不会对正在读的版本 `DROP TABLE`（见下文「检索与旧版回收的竞态」） |
 | 可启动的 Docker Compose + 交互式文档演示 | `docker compose up` 后访问 Swagger UI，含一键演示数据 |
 
 ## 快速开始（Docker Compose）
@@ -118,11 +119,38 @@ ARCHIVE_API_BASE=http://localhost:8000 python -I scripts/demo_requests.py
 
 - 每次替换创建新版本号与独立暂存表，状态机
   `ingesting → indexing → ready`（异常 → `failed`）；
-- 只有 `ready` 版本可被检索；激活在单事务内翻转 `documents.active_version_id`，
-  旧版表在切换提交后的第二个事务中删除，读者始终看到完整的一版；
+- 只有 `ready` 版本可被检索；激活在单事务内翻转 `documents.active_version_id`。
+  表的**回收与目录翻转解耦**：激活只翻指针，旧版表交给回收器（见下节），
+  读者始终看到完整的一版；
 - 坏行、重复块 ID、写盘异常都在请求内把新版本标 `failed` 并清表，旧版不动；
 - 进程被杀死后，重启时 `startup_recovery()` 把所有非终态版本标 `failed`、
-  删除残留暂存表，并通过 `/recovery` 暴露处理记录。
+  删除残留暂存表，并回收任何「非当前激活版本」遗留的表（例如慢检索钉住
+  旧版、回收被推迟期间进程被杀），通过 `/recovery` 暴露处理记录。
+
+## 检索与旧版回收的竞态（为什么不再 `no such table`）
+
+问题时序：检索请求读到目录指针、**选定旧版本 V1**，但还没来得及读任何
+文字；此时一篇更正上传完成，单事务把指针翻到 V2，并在第二个事务里
+`DROP` 掉 V1 的表。SQLite 的只读快照要到事务内第一条语句才建立，于是
+旧检索再去读 V1 就报 `no such table`（或读到错版、漏掉命中）。
+
+修复由 `app/reaper.py` 的进程内**版本回收器（VersionReaper）**协调，只保存
+整数计数，不复制任何文档数据，内存有界：
+
+1. 检索在打开读快照**之前**先对所选版本 `pin(vid)`；
+2. 更正发布只做目录翻转，然后对旧版本调用 `retire(old_vid, drop)`：
+   - 此刻没有检索钉住它 → 立即删表；
+   - 有检索钉住它 → 记录为待回收，**发布不被慢检索阻塞**，新请求立刻可查 V2；
+3. 检索在 `finally` 中 `unpin(vid)`；最后一个 pin 释放时，延迟的删表当场执行，
+   因此旧表不会被永久保留；
+4. 已进入回收（`retired`/已删）的版本拒绝新的 pin（返回 `False`），端点随即
+   重读一次目录指针、改查新的激活版本，而不是报错或读旧版；
+5. `search()` 把 `BEGIN DEFERRED` 提前到第一次访问表之前，整次查询的紧凑长度、
+   倒排读取、候选校验、命中与高亮坐标都来自**同一版本的同一快照**。
+
+由此保证：请求一旦选定版本，其结果始终来自该完整版本；慢检索未结束时更正
+照常发布、新请求查到新版；旧请求结束后过时表立即回收。崩溃等极端情况下
+未及执行的延迟删除，由启动恢复兜底清理。
 
 ## 测试
 
@@ -131,19 +159,24 @@ ARCHIVE_API_BASE=http://localhost:8000 python -I scripts/demo_requests.py
 pytest -q
 
 # 离线/无包索引环境：stdlib 垫片 + unittest（本仓库沙箱即此模式）
-python -I scripts/run_tests.py     # 19 个单元/集成测试
+python -I scripts/run_tests.py     # 单元/集成/竞态回归测试
 python -I scripts/smoke_test.py    # 真实 HTTP 端到端冒烟（守护线程内 WSGI）
 ```
 
-`tests/_shim/` 仅是离线环境对 fastapi/pydantic 的最小垫片，不进入 Docker 镜像
-（见 `.dockerignore`），生产代码只依赖 `requirements.txt` 中的真实组件。
+`tests/test_interleave.py` 用 `threading.Event` 屏障**可重复地**控制交错时序，
+覆盖：检索已选定旧版但未读文字时更正发布并回收（不再 `no such table`、
+命中与高亮坐标仍来自旧版、读完即回收旧表）、指针翻转发生在「读指针→pin」
+间隙时端点改查新版、慢检索不阻塞发布、并发读者与反复替换的压力测试，以及
+进程重启后回收延迟删除遗留的表。`tests/_shim/` 仅是离线环境对
+fastapi/pydantic 的最小垫片，不进入 Docker 镜像（见 `.dockerignore`），
+生产代码只依赖 `requirements.txt` 中的真实组件。
 
 ## 目录结构
 
 ```
-app/            FastAPI 应用、SQLite 目录、流式入库、检索引擎、响应模型
+app/            FastAPI 应用、SQLite 目录、流式入库、检索引擎、版本回收器、响应模型
 demo/           两份中文 NDJSON 示例文档
 scripts/        演示播种、演示请求、测试运行器与离线冒烟
-tests/          测试与离线垫片
+tests/          单元/集成、竞态交错回归、属性测试与离线垫片
 Dockerfile, docker-compose.yml, requirements.txt
 ```
